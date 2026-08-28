@@ -22,6 +22,7 @@ import fun88_odds as fun88
 
 st.set_page_config(page_title="CS2 Pulse", page_icon="🎯", layout="wide")
 storage.init_db()
+storage.maybe_cleanup()
 
 # ---------------------------------------------------------------------------
 # Acesso privado -- sem isto, qualquer pessoa com o URL acede à app (e aos
@@ -820,6 +821,27 @@ elif page == "Odds Fun88":
 
 elif page == "Histórico":
     st.header("Histórico de análises")
+
+    db_mb = storage.db_size_bytes() / (1024 * 1024)
+    max_mb = storage.MAX_DB_BYTES / (1024 * 1024)
+    col_a, col_b = st.columns([3, 1])
+    col_a.caption(
+        f"Base de dados: {db_mb:.1f} MB (limpeza automática dispara acima de "
+        f"{max_mb:.0f} MB, corre no máximo de 6 em 6h, e nunca apaga as 20 "
+        f"análises mais recentes)."
+    )
+    if col_b.button("🧹 Limpar agora"):
+        with st.spinner("A limpar..."):
+            result = storage.maybe_cleanup(force=True)
+        if result:
+            st.success(
+                f"Limpeza feita: {result['analysis_runs_deleted']} análises antigas "
+                f"e {result['wallet_cache_deleted']} entradas de cache removidas. "
+                f"{result['size_before_mb']} MB → {result.get('size_after_mb', '?')} MB."
+            )
+        else:
+            st.info("Sem nada a limpar de momento.")
+
     runs = storage.list_analysis_runs(limit=100)
     if not runs:
         st.info("Ainda não correste nenhuma análise. Vai a 'Analisar jogo'.")

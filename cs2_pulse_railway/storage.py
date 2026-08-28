@@ -23,6 +23,18 @@ DATA_DIR = Path(os.environ.get("DATA_DIR", Path(__file__).parent))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = DATA_DIR / "cs2_pulse.db"
 
+# --- Limpeza automática (para nunca chegar perto do limite do volume) ---
+# Por defeito, o volume do Railway tem 500MB. Deixamos margem: a limpeza
+# dispara aos 400MB e desce até 80% desse valor (320MB), nunca apagando as
+# 20 análises mais recentes, aconteça o que acontecer.
+MAX_DB_BYTES = int(os.environ.get("MAX_DB_BYTES", 400 * 1024 * 1024))
+TARGET_DB_BYTES = int(MAX_DB_BYTES * 0.8)
+CLEANUP_MIN_INTERVAL_SECONDS = 6 * 3600  # não corre mais que de 6 em 6 horas
+# O TTL máximo da cache de verificação de wallets, escolhido na UI, é de
+# 120 min -- por isso qualquer entrada com mais de 24h é garantidamente
+# inútil (nunca mais vai ser lida por um TTL tão curto).
+WALLET_CACHE_MAX_AGE_SECONDS = 24 * 3600
+
 
 @contextmanager
 def _conn():
@@ -72,6 +84,12 @@ def init_db() -> None:
                 checked_at REAL,
                 found_combo INTEGER,
                 PRIMARY KEY (wallet, event_slug)
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS app_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT
             )
         """)
 
@@ -190,3 +208,93 @@ def clear_wallet_check_cache(event_slug: str | None = None) -> None:
             conn.execute("DELETE FROM wallet_check_cache WHERE event_slug = ?", (event_slug,))
         else:
             conn.execute("DELETE FROM wallet_check_cache")
+
+
+# ---------------------------------------------------------------------------
+# Limpeza automática
+# ---------------------------------------------------------------------------
+
+def db_size_bytes() -> int:
+    try:
+        return DB_PATH.stat().st_size
+    except FileNotFoundError:
+        return 0
+
+
+def _get_meta(conn, key: str) -> str | None:
+    row = conn.execute("SELECT value FROM app_meta WHERE key = ?", (key,)).fetchone()
+    return row["value"] if row else None
+
+
+def _set_meta(conn, key: str, value: str) -> None:
+    conn.execute(
+        "INSERT INTO app_meta (key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (key, value),
+    )
+
+
+def maybe_cleanup(force: bool = False) -> dict | None:
+    """
+    Limpeza automática, pensada para nunca deixar a base de dados chegar
+    perto do limite do volume:
+
+    1. Apaga sempre entradas antigas da cache de verificação de wallets
+       (nunca são úteis passadas 24h, dado o TTL máximo da UI ser 120 min).
+    2. Só se o ficheiro estiver a aproximar-se do limite (MAX_DB_BYTES):
+       apaga as análises mais antigas em lotes (~10% de cada vez), com um
+       VACUUM entre lotes para confirmar o tamanho real no disco (o SQLite
+       não encolhe o ficheiro só por apagar linhas -- só o VACUUM liberta
+       o espaço a sério). Nunca apaga abaixo de 20 análises guardadas,
+       nem corre mais de 6 ciclos, para nunca ficar preso num loop.
+
+    Por defeito só corre de 6 em 6 horas (CLEANUP_MIN_INTERVAL_SECONDS);
+    usa force=True para ignorar esse intervalo (ex: botão manual na UI).
+
+    Devolve um resumo do que foi feito, ou None se saltou por já ter
+    corrido recentemente.
+    """
+    with _conn() as conn:
+        last_run = float(_get_meta(conn, "last_cleanup_at") or 0)
+        if not force and (time.time() - last_run) < CLEANUP_MIN_INTERVAL_SECONDS:
+            return None
+        _set_meta(conn, "last_cleanup_at", str(time.time()))
+
+    summary = {
+        "wallet_cache_deleted": 0,
+        "analysis_runs_deleted": 0,
+        "vacuumed": False,
+        "size_before_mb": round(db_size_bytes() / (1024 * 1024), 1),
+    }
+
+    with _conn() as conn:
+        cutoff = time.time() - WALLET_CACHE_MAX_AGE_SECONDS
+        cur = conn.execute("DELETE FROM wallet_check_cache WHERE checked_at < ?", (cutoff,))
+        summary["wallet_cache_deleted"] = cur.rowcount
+
+    if db_size_bytes() <= MAX_DB_BYTES:
+        summary["size_after_mb"] = round(db_size_bytes() / (1024 * 1024), 1)
+        return summary
+
+    for _ in range(10):
+        if db_size_bytes() <= TARGET_DB_BYTES:
+            break
+        with _conn() as conn:
+            remaining = conn.execute("SELECT COUNT(*) c FROM analysis_runs").fetchone()["c"]
+            if remaining <= 20:
+                break
+            batch = max(1, remaining // 4)
+            ids = [
+                r["id"] for r in conn.execute(
+                    "SELECT id FROM analysis_runs ORDER BY run_at ASC LIMIT ?", (batch,)
+                ).fetchall()
+            ]
+            conn.executemany("DELETE FROM analysis_runs WHERE id = ?", [(i,) for i in ids])
+            summary["analysis_runs_deleted"] += len(ids)
+
+        with sqlite3.connect(DB_PATH) as vconn:
+            vconn.execute("VACUUM")
+        summary["vacuumed"] = True
+
+    summary["size_after_mb"] = round(db_size_bytes() / (1024 * 1024), 1)
+    return summary
