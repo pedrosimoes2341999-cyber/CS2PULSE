@@ -1,859 +1,475 @@
 """
-polymarket_engine.py
-=====================
-Motor de deteção de combos CS2 no Polymarket, via sinal oficial `isCombo`
-da Data API. Reaproveita e organiza a lógica do script CLI original como
-funções importáveis, com callbacks de progresso em vez de prints -- para
-poderem ser usadas tanto em CLI como em Streamlit (barras de progresso).
+onchain_discovery.py
+======================
+Descoberta EXAUSTIVA de wallets que tocaram numa posição (mercado CS2),
+lendo diretamente os eventos de transferência ERC1155 do contrato CTF
+(Conditional Tokens Framework) do Polymarket na Polygon.
 
-APIs usadas (todas públicas, sem API key):
-    Gamma API   https://gamma-api.polymarket.com
-    Data API    https://data-api.polymarket.com
+PORQUÊ ISTO EXISTE
+------------------
+A API pública do Polymarket não tem nenhum endpoint que liste TODOS os
+participantes de um mercado -- só /trades (trades normais) e /holders
+(top ~20-100 por token). Uma wallet que só entrou via combo com uma
+posição pequena pode escapar às duas. A única fonte verdadeiramente
+exaustiva é a própria blockchain: cada posição (Yes/No de um mercado) é
+um token ERC1155 com um `positionId` fixo, e todo movimento desse token
+(mint, transfer, merge) fica registado num evento `TransferSingle` ou
+`TransferBatch` do contrato CTF.
+
+Isto é mais lento e pesado que a descoberta normal (pode envolver
+milhares de eventos on-chain), e por isso é opcional -- só corre quando
+ativado explicitamente.
+
+REQUISITOS
+----------
+Precisa de uma API key gratuita do Polygonscan (https://polygonscan.com/apis
+-- "Sign Up", depois "API Keys" no menu da conta; é imediato, sem espera).
+Sem key, o Polygonscan aceita pedidos mas com um limite muito baixo
+(1 pedido/5s); com key gratuita, sobe para 5 pedidos/s.
+
+LIMITAÇÕES CONHECIDAS (por serem honesto sobre o que este código faz):
+  - TransferBatch (usado quando várias posições se movem na mesma
+    transação) só é decodificado para o caso comum de 1-4 posições; casos
+    mais complexos podem ser ignorados silenciosamente (contabilizados em
+    `n_transfer_batch_ignorados` no resultado de debug).
+  - O intervalo de blocos é aproximado a partir de timestamps (a Polygon
+    não tem uma relação perfeitamente linear bloco->tempo).
+  - Nunca testado contra a API ao vivo neste ambiente (sem rede) -- corre
+    primeiro com poucas horas de intervalo para validar antes de confiares.
 """
 
 from __future__ import annotations
 
-import json
-import re
-import threading
 import time
-from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Callable, Optional
-from urllib.parse import urlparse
 
 import requests
 
-_VS_PATTERN = re.compile(r"\bvs\b", re.IGNORECASE)
+POLYGONSCAN_BASE = "https://api.etherscan.io/v2/api"
+POLYGON_CHAIN_ID = "137"
+CTF_CONTRACT = "0x4d97dcd97ec945f40cf65f87097ace5ea0476045"
 
+# Contrato que liquida as COMBOS de facto (confirmado com uma transação real
+# fornecida pelo utilizador + confirmado de forma independente por outro
+# projeto que mapeou os endereços da arquitetura nova do Polymarket, 2026).
+# As combos NÃO transferem os tokens das pernas nem passam pelo CTF/
+# PositionManager de forma que bata certo com os positionIds -- passam por
+# aqui, com um evento próprio que tem as duas wallets da negociação
+# (requester + market maker da perna) como parâmetros indexados.
+COMBOS_EXCHANGE = "0xe3333700ca9d93003f00f0f71f8515005f6c00aa"
+COMBO_SETTLEMENT_TOPIC = "0xd543adfd945773f1a62f74f0ee55a5e3b9b1a28262980ba90b1a89f2ea84d8ee"
 
-def _resolve_leg_outcome(leg: dict, known_outcomes: list[str] | None = None) -> str:
-    """
-    Tenta identificar a OPÇÃO escolhida numa perna da combo (ex: "Lavked",
-    não só o mercado "Lavked vs Vexar"). O schema exato da API de combos
-    para isto não está documentado publicamente e não devolve o nome
-    (confirmado -- só o índice), por isso aceita opcionalmente uma lista
-    `known_outcomes` vinda do Gamma (que sabemos ter os nomes reais) para
-    resolver com certeza a perna do jogo em análise.
-    """
-    idx = leg.get("leg_outcome_index")
-    if idx is None:
-        idx = leg.get("outcome_index")
-    if idx is None:
-        idx = leg.get("outcomeIndex")
+# Assinaturas de evento ERC1155 padrão (keccak256 do nome+tipos) -- não são
+# específicas do Polymarket, são o standard EIP-1155. Calculadas com uma
+# implementação Keccak-256 própria e validadas contra vetores de teste
+# conhecidos (ver _keccak_test.py) -- a primeira versão desta constante
+# TransferSingle estava truncada num caractere (erro de transcrição manual).
+TRANSFER_SINGLE_TOPIC = "0xc3d58168c5ae7397731d063d5bbf3d657854427343f4c083240f7aacaa2d0f62"
+TRANSFER_BATCH_TOPIC = "0x4a39dc06d4c0dbc64b70af90fd698a233a518aa5d07e595d983b8c0526c8f7fb"
 
-    if known_outcomes is not None and idx is not None:
-        try:
-            return str(known_outcomes[int(idx)])
-        except Exception:
-            pass
+for _name, _topic in [("TRANSFER_SINGLE_TOPIC", TRANSFER_SINGLE_TOPIC),
+                       ("TRANSFER_BATCH_TOPIC", TRANSFER_BATCH_TOPIC)]:
+    assert len(_topic) == 66, f"{_name} tem comprimento errado: {_topic!r} ({len(_topic)} chars, devia ser 66)"
 
-    direct = leg.get("outcome") or leg.get("leg_outcome") or leg.get("outcomeName")
-    if direct:
-        return str(direct)
-
-    market_info = leg.get("market", {}) or {}
-    outcomes_raw = market_info.get("outcomes")
-    if outcomes_raw is not None and idx is not None:
-        try:
-            outcomes = json.loads(outcomes_raw) if isinstance(outcomes_raw, str) else outcomes_raw
-            return str(outcomes[int(idx)])
-        except Exception:
-            pass
-
-    if idx is not None:
-        return f"outcome #{idx}"
-    return "?"
-
-
-def _leg_title(leg: dict) -> str:
-    market_info = leg.get("market", {}) or {}
-    return market_info.get("title") or market_info.get("question") or "?"
-
-
-def _parse_iso(dt_str: str | None) -> datetime | None:
-    if not dt_str:
-        return None
-    try:
-        return datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
-    except Exception:
-        return None
-
-GAMMA_BASE = "https://gamma-api.polymarket.com"
-DATA_BASE = "https://data-api.polymarket.com"
+ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
 
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "cs2-pulse-app/1.0"})
-
-REQUEST_TIMEOUT = 12
-RATE_LIMIT_SLEEP = 0.02  # a lógica de retry-on-429 já cobre picos, isto pode ser baixo
-DEFAULT_WORKERS = 12
-
-ProgressFn = Optional[Callable[[str], None]]
+_RATE_LIMIT_SLEEP = 0.25  # ~4 pedidos/s, seguro para a key gratuita (5/s)
 
 
-def _noop(msg: str) -> None:
-    pass
-
-
-def _get(url: str, params: dict | None = None) -> dict | list:
+def _ps_get(params: dict, api_key: str) -> dict:
+    """
+    Chama a Etherscan API V2 (unificada) -- a antiga api.polygonscan.com
+    foi descontinuada em ago/2025. `chainid=137` seleciona a rede Polygon.
+    """
+    params = {**params, "chainid": POLYGON_CHAIN_ID, "apikey": api_key}
     for attempt in range(4):
-        resp = SESSION.get(url, params=params, timeout=REQUEST_TIMEOUT)
-        if resp.status_code == 429:
+        resp = SESSION.get(POLYGONSCAN_BASE, params=params, timeout=20)
+        resp.raise_for_status()
+        try:
+            data = resp.json()
+        except ValueError:
+            raise RuntimeError(
+                f"Resposta não é JSON válido (status HTTP {resp.status_code}): "
+                f"{resp.text[:200]!r}"
+            )
+        # Polygonscan devolve status "0" tanto para "sem resultados" como
+        # para alguns erros -- distinguir pela mensagem
+        result_msg = str(data.get("result") or "")
+        if data.get("status") == "0" and "rate limit" in result_msg.lower():
             time.sleep(1.5 * (attempt + 1))
             continue
-        resp.raise_for_status()
-        time.sleep(RATE_LIMIT_SLEEP)
-        return resp.json()
-    raise RuntimeError(f"Falhou depois de várias tentativas: {url}")
+        if data.get("status") == "0" and any(
+            kw in result_msg.lower() for kw in ("invalid api key", "deprecated", "notok")
+        ):
+            raise RuntimeError(f"Erro da API Etherscan/Polygonscan: {result_msg}")
+        time.sleep(_RATE_LIMIT_SLEEP)
+        return data
+    raise RuntimeError("Rate limit do Polygonscan persistente após várias tentativas.")
 
 
-# ---------------------------------------------------------------------------
-# Descoberta de jogos/mercados
-# ---------------------------------------------------------------------------
-
-def find_cs2_events(limit: int = 100, closed: bool = False) -> list[dict]:
-    params = {
-        "tag_slug": "cs2",
-        "active": "true",
-        "closed": str(closed).lower(),
-        "limit": limit,
-        "order": "volume",
-        "ascending": "false",
-    }
-    data = _get(f"{GAMMA_BASE}/events", params=params)
-    return data if isinstance(data, list) else data.get("events", [])
-
-
-_OTHER_GAME_KEYWORDS = [
-    "league of legends", "dota", "valorant", "mobile legends", "overwatch",
-    "rainbow six", "call of duty", "rocket league", "starcraft",
-    "honor of kings", "epl-", "premier league", "champions league",
-    "la liga", "serie a", "bundesliga", "ligue 1", "nba", "nfl", "nhl",
-    "mlb", "wnba", "tennis", "golf", "nascar", "mma", "cricket",
-]
-
-
-def get_all_tags() -> list[dict]:
-    data = _get(f"{GAMMA_BASE}/tags")
-    return data if isinstance(data, list) else data.get("tags", [])
-
-
-def get_tag_by_slug(slug: str) -> dict | None:
-    """Busca direta de UMA tag pelo slug -- evita ter de paginar /tags
-    inteiro (que só devolve as primeiras ~50 de cada vez)."""
-    try:
-        data = _get(f"{GAMMA_BASE}/tags/slug/{slug}")
-        if isinstance(data, dict) and data.get("id"):
-            return data
-    except Exception:
-        pass
+def get_block_by_timestamp(ts: datetime, closest: str = "before", api_key: str = "") -> int | None:
+    epoch = int(ts.timestamp())
+    data = _ps_get({
+        "module": "block", "action": "getblocknobytime",
+        "timestamp": epoch, "closest": closest,
+    }, api_key)
+    if data.get("status") == "1" or data.get("message") == "OK":
+        try:
+            return int(data["result"])
+        except (KeyError, ValueError, TypeError):
+            return None
     return None
 
 
-def get_sports() -> list[dict]:
-    data = _get(f"{GAMMA_BASE}/sports")
-    return data if isinstance(data, list) else data.get("sports", [])
-
-
-def get_cs2_primary_tag_id() -> tuple[str | None, dict]:
-    """
-    Descoberta CONFIRMADA com dados reais: a tag `cs2` (id 100677) é uma
-    tag genérica só usada em props/futures -- os jogos de verdade estão
-    etiquetados com a tag `counter-strike-2` (id 100780), que é a
-    `primaryTagId` do objeto `sport` (sport=='cs2') devolvido por /sports.
-
-    Vai buscar isto dinamicamente via /sports em vez de fixar o id 100780,
-    para continuar a funcionar mesmo que o id mude no futuro. Se /sports
-    falhar por algum motivo, cai para a tag "counter-strike-2" por slug.
-    """
-    debug: dict = {}
-    try:
-        sports = get_sports()
-        debug["n_sports"] = len(sports)
-        cs2_sport = next((s for s in sports if (s.get("sport") or "").lower() == "cs2"), None)
-        if cs2_sport:
-            debug["cs2_sport_raw"] = cs2_sport
-            tag_id = cs2_sport.get("primaryTagId")
-            if tag_id:
-                return str(tag_id), debug
-        debug["aviso"] = "não encontrei sport=='cs2' em /sports, ou sem primaryTagId"
-    except Exception as e:
-        debug["erro_sports"] = str(e)
-
-    # fallback: tag por slug direto, confirmado nos dados reais do evento
-    tag = get_tag_by_slug("counter-strike-2")
-    if tag:
-        debug["fallback_tag_por_slug"] = tag
-        return str(tag.get("id")), debug
-    debug["erro_fallback"] = "também não encontrei a tag 'counter-strike-2' por slug"
-    return None, debug
-
-
-def get_events_by_tag_id(tag_id: str, max_pages: int = 10, page_size: int = 100) -> list[dict]:
-    """
-    Pagina TODOS os eventos de uma tag por tag_id (numérico) -- mais fiável
-    do que tag_slug, que nalguns casos só devolve um subconjunto fixo.
-    """
-    all_events: list[dict] = []
-    offset = 0
-    for _ in range(max_pages):
-        data = _get(f"{GAMMA_BASE}/events", params={
-            "tag_id": tag_id, "active": "true", "closed": "false",
-            "limit": page_size, "offset": offset,
-        })
-        events = data if isinstance(data, list) else data.get("events", [])
-        if not events:
-            break
-        all_events.extend(events)
-        if len(events) < page_size:
-            break
-        offset += page_size
-    return all_events
-
-
-def discover_cs2_subtags(all_tags: list[dict] | None = None) -> tuple[list[str], dict]:
-    """
-    Descobre dinamicamente as sub-tags de torneios de CS2 (ex: blast-open,
-    cct-europe, moscow-cyber-games) a partir da relação pai-filho em /tags,
-    em vez de depender de uma lista fixa que fica desatualizada.
-
-    Devolve (lista_de_slugs, debug_info) -- debug_info mostra a estrutura
-    real de um tag (chaves disponíveis) para diagnóstico, caso os nomes de
-    campo usados aqui (parentTag/parentTagId/...) não batam certo.
-    """
-    all_tags = all_tags if all_tags is not None else get_all_tags()
-    debug: dict = {"n_tags_total": len(all_tags)}
-
-    cs2_tag = next((t for t in all_tags if (t.get("slug") or "").lower() == "cs2"), None)
-    if not cs2_tag:
-        debug["erro"] = "não encontrei nenhuma tag com slug == 'cs2' em /tags"
-        return [], debug
-
-    debug["cs2_tag_raw"] = cs2_tag  # mostra TODOS os campos, para vermos o schema real
-    cs2_id = cs2_tag.get("id")
-
-    candidate_parent_fields = ["parentTag", "parentTagId", "parentId", "parent_tag_id", "parentTagID"]
-    children: list[str] = []
-    field_used = None
-    for field_name in candidate_parent_fields:
-        found = [t for t in all_tags if str(t.get(field_name)) == str(cs2_id) and t.get(field_name) is not None]
-        if found:
-            children = [t.get("slug") for t in found if t.get("slug")]
-            field_used = field_name
-            break
-
-    debug["campo_parent_usado"] = field_used
-    debug["n_subtags_encontradas"] = len(children)
-    debug["subtags"] = children
-    return children, debug
-
-
-def find_cs2_matches(limit: int = 30, scan: int = 200, debug: bool = False):
-    """
-    Filtra, de entre os eventos CS2, apenas os JOGOS (confrontos diretos
-    equipa A vs equipa B) -- exclui mercados de futures/props do torneio.
-
-    DESCOBERTA IMPORTANTE (confirmada com dados reais): a tag `cs2` no
-    Polymarket corresponde só à página de futures/props do jogo -- os
-    jogos individuais estão etiquetados por TORNEIO (ex: `moscow-cyber-games`,
-    `cct-europe`), não pela tag genérica `cs2`.
-
-    Estratégia (por ordem, para no primeiro que encontrar resultados):
-      1. Descobrir dinamicamente as sub-tags de torneio via /tags (relação
-         pai-filho com a tag `cs2`) e juntar os eventos de cada uma.
-      2. Full-text search "vs" filtrado à tag cs2, via /public-search --
-         usado como fallback, com filtro extra para excluir outros jogos
-         que a pesquisa de texto livre possa trazer por engano.
-
-    Se debug=True, devolve (matches, debug_info) com o detalhe de cada
-    tentativa, para diagnóstico.
-    """
-    debug_info: dict = {"attempts": []}
-    seen_slugs: set[str] = set()
-    unique_matches: list[dict] = []
-
-    def _has_vs(e: dict) -> bool:
-        return bool(_VS_PATTERN.search(e.get("title") or ""))
-
-    def _mentions_other_game(e: dict) -> bool:
-        title = (e.get("title") or "").lower()
-        return any(kw in title for kw in _OTHER_GAME_KEYWORDS)
-
-    def _add(events: list[dict], check_other_game: bool = False):
-        for e in events:
-            if not _has_vs(e):
-                continue
-            if check_other_game and _mentions_other_game(e):
-                continue
-            slug = e.get("slug")
-            if slug and slug not in seen_slugs:
-                seen_slugs.add(slug)
-                unique_matches.append(e)
-
-    # Tentativa 1: tag correta dos jogos -- `counter-strike-2` (não `cs2`,
-    # que é uma tag genérica só de props/futures). Descoberta dinamicamente
-    # via /sports (sport=='cs2' -> primaryTagId), confirmado com dados reais.
-    try:
-        tag_id, tag_debug = get_cs2_primary_tag_id()
-        if tag_id:
-            events = get_events_by_tag_id(tag_id, max_pages=10, page_size=100)
-            debug_info["attempts"].append({
-                "method": f"get_events_by_tag_id (tag_id={tag_id}, via /sports primaryTagId)",
-                "n_events": len(events),
-                "sample_titles": [e.get("title", "") for e in events[:10]],
-                "tag_discovery": tag_debug,
-            })
-            _add(events, check_other_game=False)
-        else:
-            debug_info["attempts"].append({
-                "method": "get_cs2_primary_tag_id",
-                "error": "não consegui descobrir o tag_id correto",
-                "tag_discovery": tag_debug,
-            })
-    except Exception as e:
-        debug_info["attempts"].append({"method": "get_events_by_tag_id", "error": str(e)})
-
-    # Tentativa 2 (fallback): descoberta dinâmica de sub-tags de torneio via /tags
-    if not unique_matches:
-        try:
-            subtags, subtag_debug = discover_cs2_subtags()
-            per_tag_results = {}
-            for tag in subtags:
-                try:
-                    data = _get(f"{GAMMA_BASE}/events", params={
-                        "tag_slug": tag, "active": "true", "closed": "false", "limit": 50,
-                    })
-                    events = data if isinstance(data, list) else data.get("events", [])
-                    per_tag_results[tag] = len(events)
-                    _add(events, check_other_game=False)
-                except Exception:
-                    per_tag_results[tag] = "erro"
-            debug_info["attempts"].append({
-                "method": "descoberta dinâmica de sub-tags via /tags",
-                "subtag_discovery": subtag_debug,
-                "resultados_por_tag": per_tag_results,
-            })
-        except Exception as e:
-            debug_info["attempts"].append({"method": "descoberta dinâmica de sub-tags", "error": str(e)})
-
-    # Tentativa 3 (fallback final): full-text search por "vs" filtrado à tag cs2
-    if not unique_matches:
-        try:
-            data = _get(f"{GAMMA_BASE}/public-search", params={
-                "q": "vs", "events_tag": "cs2", "limit_per_type": scan,
-            })
-            events = data.get("events") or []
-            debug_info["attempts"].append({
-                "method": "public-search q=vs events_tag=cs2",
-                "n_events": len(events),
-                "sample_titles": [e.get("title", "") for e in events[:10]],
-            })
-            _add(events, check_other_game=True)
-        except Exception as e:
-            debug_info["attempts"].append({"method": "public-search", "error": str(e)})
-
-    # Filtrar jogos já terminados. DESCOBERTA (confirmada com dados reais):
-    # `startDate`/`endDate` são sobre a JANELA DO MERCADO (quando abre para
-    # negociar / prazo limite de resolução), não a hora real do jogo -- por
-    # isso ordenar por essas datas trazia jogos de há duas semanas para o
-    # topo (o mercado deles simplesmente ainda não fechou). A hora real do
-    # jogo está em `startTime`, e o evento já vem com flags diretas `ended`
-    # (terminado) e `live` (a decorrer agora) -- usar essas em vez de datas.
-    def _match_start(e: dict):
-        return _parse_iso(e.get("startTime")) or _parse_iso(e.get("startDate"))
-
-    now = datetime.now(timezone.utc)
-
-    def _is_current(e: dict) -> bool:
-        if e.get("ended") is True:
-            return False
-        if e.get("live"):
-            return True
-        start = _match_start(e)
-        if start is None:
-            return True  # sem data -- não excluir por segurança
-        # janela razoável: até 24h no passado (jogos longos/atrasados a
-        # resolver) e até 21 dias no futuro (evita jogos "presos" há
-        # semanas sem resolução, que não são realmente "atuais")
-        return (now - start) <= timedelta(hours=24) and (start - now) <= timedelta(days=21)
-
-    n_before_date_filter = len(unique_matches)
-    unique_matches = [e for e in unique_matches if _is_current(e)]
-    debug_info["n_excluidos_por_data_ou_ended"] = n_before_date_filter - len(unique_matches)
-
-    # Ordenar: jogos "live" primeiro, depois por hora real de início
-    # (startTime) -- fallback para startDate só se startTime não existir.
-    def _sort_key(e: dict):
-        start = _match_start(e) or datetime.max.replace(tzinfo=timezone.utc)
-        return (not e.get("live", False), start)
-
-    unique_matches.sort(key=_sort_key)
-    result = unique_matches[:limit]
-
-    if debug:
-        return result, debug_info
-    return result
-
-
-def markets_for_event(event: dict) -> list[dict]:
-    return event.get("markets", [])
-
-
-def extract_slug_from_url(url_or_slug: str) -> str:
-    text = url_or_slug.strip()
-    if "://" not in text and "polymarket.com" not in text:
-        return text
-    if "://" not in text:
-        text = "https://" + text
-    parsed = urlparse(text)
-    segments = [s for s in parsed.path.split("/") if s]
-    if not segments:
-        raise ValueError(f"Não consegui extrair um slug do URL: {url_or_slug}")
-    slug = segments[-1]
-    for suffix in ("-more-markets",):
-        if slug.endswith(suffix):
-            slug = slug[: -len(suffix)]
-    return slug
-
-
-def get_event_by_slug(slug: str) -> dict | None:
-    data = _get(f"{GAMMA_BASE}/events", params={"slug": slug})
-    events = data if isinstance(data, list) else data.get("events", [])
-    return events[0] if events else None
-
-
-def get_market_by_slug(slug: str) -> dict | None:
-    data = _get(f"{GAMMA_BASE}/markets", params={"slug": slug})
-    markets = data if isinstance(data, list) else data.get("markets", [])
-    return markets[0] if markets else None
-
-
-def resolve_event(slug: str) -> dict | None:
-    event = get_event_by_slug(slug)
-    if event:
-        return event
-    market = get_market_by_slug(slug)
-    if not market:
+def _decode_transfer_single(data_hex: str) -> tuple[int, int] | None:
+    """data = id (32 bytes) + value (32 bytes)."""
+    h = data_hex[2:] if data_hex.startswith("0x") else data_hex
+    if len(h) < 128:
         return None
-    parent_slug = market.get("eventSlug")
-    if parent_slug and parent_slug != slug:
-        parent_event = get_event_by_slug(parent_slug)
-        if parent_event:
-            return parent_event
-    return {"title": market.get("question", slug), "slug": slug, "markets": [market]}
-
-
-def resolve_username_to_wallet(username: str) -> str | None:
-    q = username.lstrip("@").strip()
-    data = _get(
-        f"{GAMMA_BASE}/public-search",
-        params={"q": q, "search_profiles": "true", "limit_per_type": 5},
-    )
-    profiles = data.get("profiles") or []
-    if not profiles:
-        return None
-    for p in profiles:
-        if (p.get("pseudonym") or "").lower() == q.lower() or (p.get("name") or "").lower() == q.lower():
-            return p.get("proxyWallet")
-    return profiles[0].get("proxyWallet")
-
-
-def resolve_wallet_input(text: str) -> str | None:
-    raw = text.strip()
-    if raw.lower().startswith("0x") and len(raw) == 42:
-        return raw
-    candidate = raw
-    if "://" in raw or "polymarket.com" in raw:
-        if "://" not in raw:
-            raw = "https://" + raw
-        segments = [s for s in urlparse(raw).path.split("/") if s]
-        candidate = segments[-1] if segments else raw
-    if candidate.lower().startswith("0x") and len(candidate) == 42:
-        return candidate
-    return resolve_username_to_wallet(candidate)
-
-
-# ---------------------------------------------------------------------------
-# Descoberta de wallets por mercado
-# ---------------------------------------------------------------------------
-
-def discover_wallets_for_market(condition_id: str, max_pages: int = 30, label: str = "",
-                                 on_progress: ProgressFn = None) -> set[str]:
-    on_progress = on_progress or _noop
-    wallets: set[str] = set()
-    n_trades = 0
-
-    offset = 0
-    page_size = 500
-    for _ in range(max_pages):
-        params = {"market": condition_id, "limit": page_size, "offset": offset}
-        try:
-            data = _get(f"{DATA_BASE}/trades", params=params)
-        except Exception as e:
-            on_progress(f"{label} [aviso] falha a obter trades: {e}")
-            break
-        if not data:
-            break
-        n_trades += len(data)
-        for row in data:
-            w = row.get("proxyWallet")
-            if w:
-                wallets.add(w)
-        if len(data) < page_size:
-            break
-        offset += page_size
-
-    n_from_trades = len(wallets)
     try:
-        holders_data = _get(f"{DATA_BASE}/holders", params={"market": condition_id, "limit": 100})
-        for token_entry in (holders_data or []):
-            for h in (token_entry.get("holders") or []):
-                w = h.get("proxyWallet")
-                if w:
-                    wallets.add(w)
-    except Exception as e:
-        on_progress(f"{label} [aviso] falha a obter holders, a continuar sem eles: {e}")
-
-    on_progress(f"{label} {n_trades} trades, {n_from_trades} wallets por trades "
-                f"+ {len(wallets) - n_from_trades} por holders = {len(wallets)} wallets")
-    return wallets
+        token_id = int(h[0:64], 16)
+        value = int(h[64:128], 16)
+        return token_id, value
+    except ValueError:
+        return None
 
 
-# ---------------------------------------------------------------------------
-# Deteção de combos via /activity (isCombo=true)
-# ---------------------------------------------------------------------------
-
-def get_activity(user: str, market_ids: list[str] | None = None, type_: str = "TRADE",
-                  max_pages: int = 10, start: int | None = None) -> list[dict]:
+def _decode_transfer_batch_simple(data_hex: str) -> list[tuple[int, int]]:
     """
-    IMPORTANTE: uma linha isCombo=true tem `conditionId` = ID da COMBO, não
-    do mercado-perna. Para apanhar combos, chamar SEM market_ids.
-
-    `start` (opcional): timestamp epoch a partir do qual procurar -- reduz
-    o volume de dados pedidos para wallets muito ativas, à custa de poder
-    perder combos feitas antes dessa data (usar com cuidado).
+    Decodificação simplificada de TransferBatch para o caso comum
+    (arrays curtos, sem padding estranho). Devolve [] se não conseguir
+    decodificar com confiança -- melhor perder um evento raro do que
+    dar resultados errados.
     """
-    rows: list[dict] = []
-    offset = 0
-    page_size = 500
-    for _ in range(max_pages):
-        params = {"user": user, "type": type_, "limit": page_size, "offset": offset}
-        if market_ids:
-            params["market"] = ",".join(market_ids)
-        if start is not None:
-            params["start"] = start
-        data = _get(f"{DATA_BASE}/activity", params=params)
-        if not data:
-            break
-        rows.extend(data)
-        if len(data) < page_size:
-            break
-        offset += page_size
-    return rows
+    h = data_hex[2:] if data_hex.startswith("0x") else data_hex
+    try:
+        # layout ABI: offset_ids(32) + offset_values(32) + len_ids(32) +
+        # ids... + len_values(32) + values...
+        offset_ids = int(h[0:64], 16) * 2  # em chars hex
+        offset_values = int(h[64:128], 16) * 2
+        len_ids = int(h[offset_ids:offset_ids + 64], 16)
+        ids = []
+        for i in range(len_ids):
+            start = offset_ids + 64 + i * 64
+            ids.append(int(h[start:start + 64], 16))
+        len_values = int(h[offset_values:offset_values + 64], 16)
+        values = []
+        for i in range(len_values):
+            start = offset_values + 64 + i * 64
+            values.append(int(h[start:start + 64], 16))
+        if len(ids) != len(values):
+            return []
+        return list(zip(ids, values))
+    except (ValueError, IndexError):
+        return []
 
 
-def get_combo_activity(user: str, combo_condition_id: str) -> list[dict]:
-    data = _get(
-        f"{DATA_BASE}/v1/activity/combos",
-        params={"user": user, "market_id": combo_condition_id, "limit": 50},
-    )
-    if isinstance(data, dict):
-        return data.get("activity", [])
-    return data or []
+def _topic_to_address(topic: str) -> str:
+    """Um topic de endereço vem com padding a 32 bytes -- extrai os últimos 20."""
+    h = topic[2:] if topic.startswith("0x") else topic
+    return "0x" + h[-40:]
 
 
-@dataclass
-class ComboRow:
-    jogo: str
-    wallet: str
-    combo_condition_id: str
-    tx_hash: str
-    timestamp: int
-    n_pernas_totais: int
-    n_pernas_neste_jogo: int
-    amount_usdc: float
-    condition_id_perna: str
-    perna_titulo: str
-    opcao_escolhida: str
-    outras_pernas_da_combo: str
-    wallet_e_holder_do_jogo: bool
-
-
-def find_combos_for_wallet(
-    wallet: str, event_title: str, condition_ids: list[str], debug_cb: ProgressFn = None,
-    activity_start_ts: int | None = None, outcomes_by_condition_id: dict[str, list[str]] | None = None,
-) -> list[ComboRow]:
+def get_transaction_logs(tx_hash: str, api_key: str) -> dict:
     """
-    activity_start_ts (opcional): restringe a consulta de atividade a partir
-    desta data (epoch) -- acelera para wallets muito ativas, mas pode
-    perder combos feitas antes dessa data. Usar só quando a velocidade
-    importa mais do que a garantia de completude total.
-    outcomes_by_condition_id (opcional): mapa condition_id -> lista de
-    nomes de outcomes (ex: ["Lavked", "Vexar"]), vindo do Gamma -- usado
-    para resolver com certeza a opção escolhida nas pernas DESTE jogo,
-    já que a API de combos não devolve o nome, só o índice.
+    Vai buscar o recibo de UMA transação específica e devolve os seus logs
+    em bruto (endereço do contrato + topics + data de cada evento emitido).
+    Serve para diagnosticar, a partir de uma transação real e conhecida,
+    que contrato(s) e evento(s) o Polymarket realmente usa para liquidar
+    uma combo -- em vez de adivinhar a partir de documentação genérica.
     """
-    debug_cb = debug_cb or _noop
-    outcomes_by_condition_id = outcomes_by_condition_id or {}
-    all_rows = get_activity(wallet, market_ids=None, type_="TRADE", start=activity_start_ts)
-
-    non_combo_condition_ids = {
-        r["conditionId"] for r in all_rows
-        if not r.get("isCombo") and r["conditionId"] in condition_ids
+    data = _ps_get({
+        "module": "proxy", "action": "eth_getTransactionReceipt",
+        "txhash": tx_hash,
+    }, api_key)
+    result = data.get("result")
+    if not result:
+        return {"erro": f"Sem resultado para {tx_hash}", "resposta_bruta": data}
+    logs = result.get("logs", [])
+    return {
+        "tx_hash": tx_hash,
+        "status": result.get("status"),
+        "n_logs": len(logs),
+        "logs": [
+            {
+                "address": log.get("address"),
+                "topics": log.get("topics"),
+                "data": log.get("data"),
+            }
+            for log in logs
+        ],
     }
 
-    combo_rows_raw = [r for r in all_rows if r.get("isCombo")]
-    if not combo_rows_raw:
-        return []
 
-    seen_combo_ids: set[str] = set()
-    out: list[ComboRow] = []
-    for r in combo_rows_raw:
-        combo_condition_id = r["conditionId"]
-        if combo_condition_id in seen_combo_ids:
-            continue
-        seen_combo_ids.add(combo_condition_id)
+def get_contract_source(address: str, api_key: str) -> dict:
+    """
+    Verifica se um contrato tem código-fonte verificado publicamente --
+    se tiver, dá-nos a estrutura real dos eventos (ABI) em vez de termos
+    de adivinhar a partir dos topics em bruto.
+    """
+    data = _ps_get({
+        "module": "contract", "action": "getsourcecode",
+        "address": address,
+    }, api_key)
+    result = data.get("result")
+    if not result or not isinstance(result, list):
+        return {"erro": "sem resposta", "resposta_bruta": data}
+    info = result[0]
+    return {
+        "address": address,
+        "contract_name": info.get("ContractName"),
+        "is_verified": bool(info.get("SourceCode")),
+        "abi_disponivel": info.get("ABI") not in (None, "", "Contract source code not verified"),
+        "proxy": info.get("Proxy"),
+        "implementation": info.get("Implementation"),
+    }
 
-        details = get_combo_activity(wallet, combo_condition_id)
-        for d in details:
-            legs = d.get("legs", [])
-            legs_neste_jogo = [leg for leg in legs if leg.get("leg_condition_id") in condition_ids]
-            if not legs_neste_jogo:
+
+def get_combo_settlement_wallets(
+    from_block: int,
+    to_block: int,
+    api_key: str,
+    max_pages: int = 20,
+    on_progress=None,
+) -> tuple[set[str], dict]:
+    """
+    Descoberta EXAUSTIVA de participantes em combos, via o evento real de
+    liquidação do CombosExchange (confirmado contra uma transação real).
+
+    Cada ocorrência do evento tem duas wallets como parâmetros indexados
+    (topics[2] e topics[3]) -- a que pediu a combo (requester) e a que
+    forneceu a liquidez para essa perna (market maker). Não sabemos ao
+    certo qual é qual em cada caso, por isso adicionamos AMBAS ao conjunto
+    de candidatas -- a verificação seguinte (via API oficial do Polymarket)
+    é que confirma com certeza se cada uma tem mesmo uma combo relevante
+    para o jogo em questão, por isso incluir candidatas a mais não estraga
+    o resultado, só o torna mais lento.
+
+    IMPORTANTE: isto varre TODAS as combos da plataforma nesse intervalo de
+    blocos, não só as do jogo em causa -- é por isso mais lento, mas é a
+    forma correta de não perder nenhuma.
+    """
+    on_progress = on_progress or (lambda msg: None)
+    wallets: set[str] = set()
+    debug = {"n_logs": 0, "n_paginas": 0}
+
+    page = 1
+    while page <= max_pages:
+        data = _ps_get({
+            "module": "logs", "action": "getLogs",
+            "address": COMBOS_EXCHANGE,
+            "topic0": COMBO_SETTLEMENT_TOPIC,
+            "fromBlock": from_block, "toBlock": to_block,
+            "page": page, "offset": 1000,
+        }, api_key)
+        debug["n_paginas"] += 1
+        result = data.get("result")
+        if page == 1:
+            debug["pagina1_status"] = data.get("status")
+            debug["pagina1_message"] = data.get("message")
+        if not result or not isinstance(result, list):
+            break
+        on_progress(f"  Liquidações de combo página {page}: {len(result)} logs")
+        for log in result:
+            topics = log.get("topics", [])
+            if len(topics) < 4:
                 continue
-            is_holder = any(leg["leg_condition_id"] in non_combo_condition_ids for leg in legs_neste_jogo)
-            for leg in legs_neste_jogo:
-                outras_pernas = [
-                    f"{_leg_title(other)} — "
-                    f"{_resolve_leg_outcome(other, outcomes_by_condition_id.get(other.get('leg_condition_id')))}"
-                    for other in legs
-                    if other.get("leg_condition_id") != leg.get("leg_condition_id")
-                ]
-                out.append(
-                    ComboRow(
-                        jogo=event_title,
-                        wallet=wallet,
-                        combo_condition_id=combo_condition_id,
-                        tx_hash=d.get("tx_hash", ""),
-                        timestamp=d.get("timestamp", 0),
-                        n_pernas_totais=len(legs),
-                        n_pernas_neste_jogo=len(legs_neste_jogo),
-                        amount_usdc=float(d.get("amount_usdc") or 0),
-                        condition_id_perna=leg.get("leg_condition_id", ""),
-                        perna_titulo=_leg_title(leg),
-                        opcao_escolhida=_resolve_leg_outcome(
-                            leg, outcomes_by_condition_id.get(leg.get("leg_condition_id"))),
-                        outras_pernas_da_combo="; ".join(outras_pernas) if outras_pernas else "(perna única)",
-                        wallet_e_holder_do_jogo=is_holder,
-                    )
-                )
-        if out:
-            tag = "HOLDER" if out[-1].wallet_e_holder_do_jogo else "SÓ-COMBO"
-            debug_cb(f"combo {combo_condition_id[:12]}... wallet={wallet[:10]}... [{tag}] "
-                     f"valor≈${out[-1].amount_usdc:.2f}")
-    return out
+            debug["n_logs"] += 1
+            for topic in (topics[2], topics[3]):
+                addr = _topic_to_address(topic)
+                if addr.lower() != ZERO_ADDRESS and addr.lower() != COMBOS_EXCHANGE.lower():
+                    wallets.add(addr)
+        if len(result) < 1000:
+            break
+        page += 1
+
+    on_progress(f"Liquidações de combo: {debug['n_logs']} eventos, {len(wallets)} wallets candidatas")
+    return wallets, debug
 
 
-# ---------------------------------------------------------------------------
-# Orquestração
-# ---------------------------------------------------------------------------
-
-def analyze_event(event: dict, workers: int = DEFAULT_WORKERS,
-                   on_progress: ProgressFn = None,
-                   on_stage: Optional[Callable[[str, float], None]] = None,
-                   extra_wallets: list[str] | None = None,
-                   activity_start_ts: int | None = None,
-                   skip_wallets: set[str] | None = None,
-                   on_wallet_checked: Optional[Callable[[str, bool], None]] = None) -> list[ComboRow]:
+def get_ctf_transfer_wallets(
+    token_ids: set[str],
+    from_block: int,
+    to_block: int,
+    api_key: str,
+    max_pages: int = 20,
+    on_progress=None,
+) -> tuple[set[str], dict]:
     """
-    on_progress(msg): linhas de log (para uma área de texto/expander)
-    on_stage(label, fraction 0-1): para uma barra de progresso
-    extra_wallets: wallets a verificar SEMPRE, além das descobertas
-        automaticamente (ex: vindas da watchlist) -- útil porque a API
-        pública do Polymarket não tem forma de listar TODOS os
-        participantes de um mercado (só top holders + trades normais), por
-        isso uma wallet que só entrou via combo com posição pequena pode
-        escapar à descoberta automática.
-    activity_start_ts: opcional, restringe a verificação de atividade de
-        cada wallet a partir desta data (epoch) -- acelera bastante quando
-        há muitas wallets candidatas (ex: modo exaustivo on-chain), à custa
-        de poder perder combos feitas antes dessa data.
-    skip_wallets: wallets a NÃO verificar (já verificadas recentemente para
-        este jogo, sem combo encontrada) -- acelera re-análises do mesmo
-        jogo. Wallets com combo encontrada nunca devem entrar aqui (só
-        cachear negativos, para nunca mostrar dados desatualizados).
-    on_wallet_checked(wallet, encontrou_combo): chamado depois de cada
-        wallet ser verificada, para a app poder gravar em cache.
+    Devolve o conjunto de wallets (from/to) envolvidas em transferências
+    dos token_ids indicados, dentro do intervalo de blocos dado.
     """
-    on_progress = on_progress or _noop
-    on_stage = on_stage or (lambda label, frac: None)
+    on_progress = on_progress or (lambda msg: None)
+    target_ids = {int(t) for t in token_ids}
+    wallets: set[str] = set()
+    debug = {"n_logs_transfer_single": 0, "n_logs_transfer_batch": 0,
+             "n_transfer_batch_ignorados": 0, "n_paginas": 0,
+             "target_ids_amostra": [str(t) for t in list(target_ids)[:3]],
+             "ids_vistos_amostra": []}
+    seen_ids_sample: set[int] = set()
 
-    title = event.get("title", event.get("slug", "?"))
-    markets = markets_for_event(event)
-    condition_ids = [m["conditionId"] for m in markets if m.get("conditionId")]
-    if not condition_ids:
-        on_progress("(sem mercados encontrados)")
-        return []
+    for topic0, label in [(TRANSFER_SINGLE_TOPIC, "TransferSingle"), (TRANSFER_BATCH_TOPIC, "TransferBatch")]:
+        page = 1
+        n_paginas_este_topico = 0
+        while page <= max_pages:
+            data = _ps_get({
+                "module": "logs", "action": "getLogs",
+                "address": CTF_CONTRACT,
+                "topic0": topic0,
+                "fromBlock": from_block, "toBlock": to_block,
+                "page": page, "offset": 1000,
+            }, api_key)
+            debug["n_paginas"] += 1
+            n_paginas_este_topico += 1
+            result = data.get("result")
+            if page == 1:
+                # guardar a resposta bruta da 1ª página se vier vazia/erro,
+                # para diagnosticar sem adivinhar (ex: topic0 errado dava
+                # status "0" com uma mensagem, não simplesmente [])
+                debug[f"{label}_pagina1_status"] = data.get("status")
+                debug[f"{label}_pagina1_message"] = data.get("message")
+                if not result:
+                    debug[f"{label}_pagina1_result_bruto"] = str(data.get("result"))[:150]
+            if not result or not isinstance(result, list):
+                break
+            on_progress(f"  {label} página {page}: {len(result)} logs")
+            for log in result:
+                topics = log.get("topics", [])
+                if len(topics) < 4:
+                    continue
+                from_addr = _topic_to_address(topics[2])
+                to_addr = _topic_to_address(topics[3])
+                log_data = log.get("data", "")
 
-    # nomes reais dos outcomes de cada mercado deste jogo (vindos do Gamma,
-    # que sabemos ter os nomes corretos) -- usados para resolver a "opção
-    # escolhida" em cada perna com certeza, já que a API de combos só
-    # devolve o índice, não o nome
-    outcomes_by_condition_id: dict[str, list[str]] = {}
-    for mkt in markets:
-        cid = mkt.get("conditionId")
-        outcomes_raw = mkt.get("outcomes")
-        if cid and outcomes_raw:
-            try:
-                outcomes_by_condition_id[cid] = (
-                    json.loads(outcomes_raw) if isinstance(outcomes_raw, str) else outcomes_raw
-                )
-            except Exception:
-                pass
+                if topic0 == TRANSFER_SINGLE_TOPIC:
+                    debug["n_logs_transfer_single"] += 1
+                    decoded = _decode_transfer_single(log_data)
+                    if not decoded:
+                        continue
+                    token_id, _value = decoded
+                    if len(seen_ids_sample) < 8:
+                        seen_ids_sample.add(token_id)
+                    if token_id in target_ids:
+                        for addr in (from_addr, to_addr):
+                            if addr.lower() != ZERO_ADDRESS:
+                                wallets.add(addr)
+                else:
+                    debug["n_logs_transfer_batch"] += 1
+                    pairs = _decode_transfer_batch_simple(log_data)
+                    if not pairs:
+                        debug["n_transfer_batch_ignorados"] += 1
+                        continue
+                    for tid, _v in pairs:
+                        if len(seen_ids_sample) < 8:
+                            seen_ids_sample.add(tid)
+                    if any(tid in target_ids for tid, _v in pairs):
+                        for addr in (from_addr, to_addr):
+                            if addr.lower() != ZERO_ADDRESS:
+                                wallets.add(addr)
 
-    on_stage(f"A descobrir wallets em {len(condition_ids)} mercados...", 0.05)
-    all_wallets: set[str] = set()
-    n_market_workers = min(workers, len(condition_ids)) or 1
-    with ThreadPoolExecutor(max_workers=n_market_workers) as ex:
-        futures = {
-            ex.submit(discover_wallets_for_market, cid, label=f"[{i}/{len(condition_ids)}]",
-                      on_progress=on_progress): cid
-            for i, cid in enumerate(condition_ids, start=1)
-        }
-        for fut in as_completed(futures):
-            try:
-                all_wallets |= fut.result()
-            except Exception as e:
-                on_progress(f"[aviso] falha num mercado: {e}")
+            if len(result) < 1000:
+                break
+            page += 1
+        debug[f"{label}_n_paginas"] = n_paginas_este_topico
 
-    if extra_wallets:
-        n_extra_novas = len(set(extra_wallets) - all_wallets)
-        all_wallets |= set(extra_wallets)
-        on_progress(f"+{n_extra_novas} wallets da watchlist adicionadas (sempre verificadas)")
-
-    if skip_wallets:
-        n_before_cache = len(all_wallets)
-        all_wallets -= skip_wallets
-        n_skipped = n_before_cache - len(all_wallets)
-        if n_skipped:
-            on_progress(f"-{n_skipped} wallets saltadas (já verificadas recentemente, sem combo)")
-
-    on_progress(f"Total: {len(all_wallets)} wallets únicas")
-    on_stage(f"A verificar combos em {len(all_wallets)} wallets...", 0.2)
-
-    rows: list[ComboRow] = []
-    done = 0
-    lock = threading.Lock()
-    n_wallets = len(all_wallets) or 1
-
-    def _check(wallet: str) -> list[ComboRow]:
-        result = find_combos_for_wallet(wallet, title, condition_ids, debug_cb=on_progress,
-                                         activity_start_ts=activity_start_ts,
-                                         outcomes_by_condition_id=outcomes_by_condition_id)
-        if on_wallet_checked:
-            try:
-                on_wallet_checked(wallet, bool(result))
-            except Exception:
-                pass
-        return result
-
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        futures = {ex.submit(_check, w): w for w in all_wallets}
-        for fut in as_completed(futures):
-            wallet = futures[fut]
-            with lock:
-                done += 1
-                frac = 0.2 + 0.8 * (done / n_wallets)
-                on_stage(f"A verificar wallets ({done}/{n_wallets})...", frac)
-            try:
-                rows.extend(fut.result())
-            except Exception as e:
-                on_progress(f"[aviso] falha na wallet {wallet[:10]}...: {e}")
-
-    on_stage("Concluído", 1.0)
-    on_progress(f"Combos encontradas: {len({r.combo_condition_id for r in rows})}")
-    return rows
+    debug["ids_vistos_amostra"] = [str(t) for t in seen_ids_sample]
+    return wallets, debug
 
 
-def rows_to_dicts(rows: list[ComboRow]) -> list[dict]:
-    return [
-        {
-            "jogo": r.jogo,
-            "wallet": r.wallet,
-            "combo_condition_id": r.combo_condition_id,
-            "tx_hash": r.tx_hash,
-            "timestamp": r.timestamp,
-            "n_pernas_totais": r.n_pernas_totais,
-            "n_pernas_neste_jogo": r.n_pernas_neste_jogo,
-            "valor_investido_usdc": round(r.amount_usdc, 2),
-            "perna_condition_id": r.condition_id_perna,
-            "perna_titulo": r.perna_titulo,
-            "opcao_escolhida": r.opcao_escolhida,
-            "outras_pernas_da_combo": r.outras_pernas_da_combo,
-            "wallet_e_holder_do_jogo": r.wallet_e_holder_do_jogo,
-        }
-        for r in rows
-    ]
-
-
-# ---------------------------------------------------------------------------
-# Leaderboard (para o feed de "smart money")
-# ---------------------------------------------------------------------------
-
-def get_leaderboard(category: str = "OVERALL", time_period: str = "DAY", limit: int = 20) -> list[dict]:
+def discover_wallets_onchain(
+    event: dict,
+    api_key: str,
+    on_progress=None,
+    window_hours_before: float = 2.0,
+    window_hours_after: float = 6.0,
+    skip_ctf_scan: bool = True,
+) -> tuple[set[str], dict]:
     """
-    category: OVERALL, POLITICS, SPORTS, ESPORTS, CRYPTO, CULTURE, MENTIONS,
-              WEATHER, ECONOMICS, TECH, FINANCE
-    time_period: DAY, WEEK, MONTH, ALL
+    Ponto de entrada principal: dado um evento (jogo) do Polymarket, junta
+    os positionIds de todos os mercados, calcula um intervalo de blocos à
+    volta da hora real do jogo (startTime), e lê os logs on-chain.
 
-    NOTA: não existe uma categoria específica para CS2 -- ESPORTS inclui
-    todos os jogos (LoL, Dota, Valorant, etc.). Para filtrar só CS2, usa
-    filter_leaderboard_by_cs2_activity() depois de obter este leaderboard.
+    skip_ctf_scan: por omissão True -- a vigilância de transferências
+    diretas dos tokens das pernas (CTF/PositionManager) NUNCA encontra
+    combos (confirmado com dados reais), só serve para holders normais que
+    a descoberta habitual já apanha de outra forma. Saltar isto poupa
+    aproximadamente metade do tempo do modo exaustivo.
     """
-    data = _get(f"{DATA_BASE}/v1/leaderboard",
-                params={"category": category, "timePeriod": time_period, "limit": limit})
-    return data if isinstance(data, list) else data.get("leaderboard", [])
+    on_progress = on_progress or (lambda msg: None)
+    debug: dict = {}
 
+    token_ids: set[str] = set()
+    for market in event.get("markets", []):
+        for pid in market.get("positionIds", []) or []:
+            token_ids.add(str(pid))
+    debug["n_token_ids"] = len(token_ids)
+    if not token_ids and not skip_ctf_scan:
+        debug["erro"] = "sem positionIds nos mercados deste evento"
+        return set(), debug
 
-def filter_leaderboard_by_cs2_activity(
-    leaderboard: list[dict], cs2_condition_ids: list[str],
-    on_progress: ProgressFn = None, workers: int = 15,
-) -> list[dict]:
-    """
-    Cruza um leaderboard (ex: categoria ESPORTS) com atividade real em
-    mercados CS2, para chegar a uma lista só de traders que de facto
-    negoceiam CS2. Uma chamada /activity por trader, em paralelo.
-    """
-    on_progress = on_progress or _noop
+    start_str = event.get("startTime") or event.get("startDate")
+    try:
+        match_start = datetime.fromisoformat(start_str.replace("Z", "+00:00"))
+    except Exception:
+        match_start = datetime.now(timezone.utc)
 
-    def _check(entry: dict) -> dict | None:
-        wallet = entry.get("proxyWallet") or entry.get("wallet")
-        if not wallet:
-            return None
-        rows = get_activity(wallet, market_ids=cs2_condition_ids, type_="TRADE")
-        on_progress(f"  {entry.get('userName', wallet[:10])}: "
-                    f"{len(rows)} trades CS2 encontrados")
-        if rows:
-            entry = dict(entry)
-            entry["cs2_trades_encontrados"] = len(rows)
-            return entry
-        return None
+    now_utc = datetime.now(timezone.utc)
+    from_ts = match_start.timestamp() - window_hours_before * 3600
+    to_ts = match_start.timestamp() + window_hours_after * 3600
+    from_dt = datetime.fromtimestamp(from_ts, tz=timezone.utc)
+    to_dt = datetime.fromtimestamp(to_ts, tz=timezone.utc)
 
-    result: list[dict] = []
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        futures = [ex.submit(_check, entry) for entry in leaderboard]
-        for fut in as_completed(futures):
-            r = fut.result()
-            if r is not None:
-                result.append(r)
+    # nunca pedir um bloco no futuro -- a Etherscan/Polygonscan não
+    # consegue converter um timestamp que ainda não aconteceu (a
+    # blockchain ainda não produziu esses blocos), o que causava o erro
+    # "não consegui converter timestamps em blocos" quando o jogo ainda
+    # estava a decorrer ou tinha acabado há pouco tempo
+    to_block_mode = "after"
+    if to_dt > now_utc:
+        on_progress(f"Janela ia até ao futuro ({to_dt.isoformat()}) -- a limitar a 'agora'.")
+        to_dt = now_utc
+        to_block_mode = "before"
+    if from_dt > now_utc:
+        from_dt = now_utc - timedelta(minutes=5)
+        to_block_mode = "before"
 
-    # ordenar pelo mesmo critério do leaderboard original (rank), já que a
-    # ordem pode ter ficado embaralhada pelo paralelismo
-    def _rank_key(e: dict):
-        r = e.get("rank", "")
-        return int(r) if str(r).isdigit() else 10**9
+    on_progress(f"A converter janela temporal ({from_dt.isoformat()} .. {to_dt.isoformat()}) em blocos...")
+    from_block = get_block_by_timestamp(from_dt, "before", api_key)
+    to_block = get_block_by_timestamp(to_dt, to_block_mode, api_key)
+    debug["from_block"] = from_block
+    debug["to_block"] = to_block
+    if from_block is None or to_block is None:
+        debug["erro"] = "não consegui converter timestamps em blocos (ver chave da API)"
+        return set(), debug
 
-    result.sort(key=_rank_key)
-    return result
+    on_progress(f"A ler logs on-chain entre os blocos {from_block} e {to_block}...")
+
+    # Fonte 1 (a que realmente importa para combos): eventos de liquidação
+    # do CombosExchange -- varre TODAS as combos da plataforma nesse
+    # intervalo, não só as deste jogo, mas é a única forma de não perder
+    # nenhuma. A verificação seguinte (API oficial) filtra o que é
+    # relevante para este jogo especificamente.
+    combo_wallets, combo_debug = get_combo_settlement_wallets(
+        from_block, to_block, api_key, on_progress=on_progress,
+    )
+    debug["combo_settlement"] = combo_debug
+
+    # Fonte 2 (complementar, opcional): transferências diretas dos tokens
+    # das pernas -- não apanha combos (ver descoberta documentada acima),
+    # só holders "normais" que a descoberta habitual possa ter perdido.
+    # Por omissão SALTADA (skip_ctf_scan=True) para poupar tempo, já que
+    # não ajuda o objetivo principal (combos).
+    ctf_wallets: set[str] = set()
+    if skip_ctf_scan:
+        debug["ctf_transfers"] = {"saltado": True}
+    elif token_ids:
+        ctf_wallets, ctf_debug = get_ctf_transfer_wallets(
+            token_ids, from_block, to_block, api_key, on_progress=on_progress,
+        )
+        debug["ctf_transfers"] = ctf_debug
+
+    wallets = combo_wallets | ctf_wallets
+    on_progress(f"Encontradas {len(wallets)} wallets via leitura on-chain "
+                f"({len(combo_wallets)} via combos, {len(ctf_wallets)} via transferências CTF).")
+    return wallets, debug
